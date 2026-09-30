@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
 import joblib
@@ -99,13 +100,27 @@ if 'initialized' not in st.session_state:
     st.session_state['simulating']  = False
     st.session_state['initialized'] = True
 
+# Vitals that show early warning signs — move throughout all 20 steps
+_EARLY_VITALS = {'heart_rate', 'resp_rate', 'temperature', 'trend_hr', 'trend_rr', 'missing_rate'}
+# Critical vitals — only start deteriorating from step 10 onward
+_LATE_VITALS  = {'systolic_bp', 'diastolic_bp', 'map', 'spo2', 'lactate',
+                  'creatinine', 'wbc', 'hemoglobin', 'fluid_balance_ml_24h',
+                  'trend_map', 'trend_spo2'}
+
 # ── Advance one simulation step ───────────────────────────────────────────────
 def advance_simulation():
     step = st.session_state['sim_step']
-    frac = (step + 1) / TOTAL_STEPS
+
+    # Early vitals: spread linearly across all 20 steps
+    frac_early = (step + 1) / TOTAL_STEPS
+
+    # Late (critical) vitals: only start moving after step 9,
+    # then accelerate over the remaining 10 steps
+    frac_late  = max(0.0, (step - 9) / (TOTAL_STEPS - 10)) if TOTAL_STEPS > 10 else frac_early
 
     for key, target in DETERIORATION_TARGETS.items():
-        start   = DEFAULTS[key]
+        start = DEFAULTS[key]
+        frac  = frac_early if key in _EARLY_VITALS else frac_late
         new_val = start + (target - start) * frac
         lo, hi  = SLIDER_BOUNDS[key]
         if isinstance(DEFAULTS[key], float):
@@ -114,9 +129,9 @@ def advance_simulation():
             st.session_state[key] = int(np.clip(round(new_val), lo, hi))
 
     # Activate ventilator halfway, vasopressor at 70%
-    if frac >= 0.5:
+    if frac_early >= 0.5:
         st.session_state['ventilator'] = True
-    if frac >= 0.7:
+    if frac_early >= 0.7:
         st.session_state['vasopressor'] = True
 
     st.session_state['sim_step'] += 1
@@ -255,10 +270,214 @@ with col2:
 with col3:
     st.metric("Final Score", f"{final_score:.1%}")
 
+# ── Big Alert Light ──────────────────────────────────────────────────────────
 if alert:
-    st.error(f"⚠️ ALERT: High risk of deterioration! (Threshold: {threshold:.2f})")
+    components.html(
+        f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <style>
+          * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+          body {{
+            background: #0e1117;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 240px;
+            font-family: 'Segoe UI', sans-serif;
+          }}
+          .card {{
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 12px;
+            background: rgba(180, 0, 0, 0.08);
+            border: 1px solid rgba(255, 80, 80, 0.25);
+            border-radius: 18px;
+            padding: 28px 48px;
+            backdrop-filter: blur(10px);
+          }}
+          .bulb {{
+            width: 90px;
+            height: 90px;
+            border-radius: 50%;
+            background: radial-gradient(circle at 38% 35%, #ff8080, #cc0000 55%, #7a0000);
+            box-shadow:
+              0 0 28px 8px rgba(220,0,0,0.85),
+              0 0 70px 25px rgba(200,0,0,0.45);
+            animation: pulse-red 0.9s ease-in-out infinite alternate;
+            border: 3px solid rgba(255, 110, 110, 0.45);
+          }}
+          @keyframes pulse-red {{
+            from {{ box-shadow: 0 0 28px 8px rgba(220,0,0,0.85), 0 0 70px 25px rgba(200,0,0,0.45); }}
+            to   {{ box-shadow: 0 0 52px 20px rgba(255,0,0,1.0), 0 0 110px 45px rgba(220,0,0,0.75); }}
+          }}
+          .label {{
+            color: #ff4444;
+            font-size: 1.45rem;
+            font-weight: 800;
+            letter-spacing: 3px;
+            text-shadow: 0 0 14px rgba(255, 50, 50, 0.9);
+            animation: flicker 0.9s ease-in-out infinite alternate;
+          }}
+          @keyframes flicker {{
+            from {{ opacity: 1; }}
+            to   {{ opacity: 0.82; }}
+          }}
+          .score {{
+            color: #ffaaaa;
+            font-size: 0.88rem;
+            letter-spacing: 0.5px;
+          }}
+          .mute-btn {{
+            margin-top: 4px;
+            padding: 8px 26px;
+            background: rgba(200, 0, 0, 0.45);
+            color: #fff;
+            border: 1px solid rgba(255, 100, 100, 0.55);
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            font-weight: 600;
+            transition: background 0.2s;
+          }}
+          .mute-btn:hover {{ background: rgba(220, 30, 30, 0.7); }}
+        </style>
+        </head>
+        <body>
+        <div class="card">
+          <div class="bulb"></div>
+          <div class="label">⚠️ ALERT — HIGH RISK</div>
+          <div class="score">Threshold: {threshold:.2f} &nbsp;|&nbsp; Score: {final_score:.1%}</div>
+          <button class="mute-btn" id="alarmBtn" onclick="toggleAlarm()">🔇 Mute Alarm</button>
+        </div>
+
+        <script>
+          var muted = false;
+          var ctx = null;
+          var alarmInterval = null;
+
+          function getCtx() {{
+            if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+            return ctx;
+          }}
+
+          function beep(freq, start, dur, vol) {{
+            var c = getCtx();
+            var osc = c.createOscillator();
+            var g   = c.createGain();
+            osc.connect(g); g.connect(c.destination);
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(freq, start);
+            g.gain.setValueAtTime(vol, start);
+            g.gain.exponentialRampToValueAtTime(0.001, start + dur);
+            osc.start(start); osc.stop(start + dur + 0.05);
+          }}
+
+          function siren() {{
+            if (muted) return;
+            var c = getCtx(), now = c.currentTime;
+            beep(1040, now,        0.18, 0.5);
+            beep(820,  now + 0.22, 0.18, 0.5);
+            beep(1040, now + 0.46, 0.18, 0.5);
+            beep(820,  now + 0.68, 0.18, 0.5);
+          }}
+
+          function toggleAlarm() {{
+            muted = !muted;
+            var btn = document.getElementById('alarmBtn');
+            if (muted) {{
+              btn.textContent = '🔔 Unmute Alarm';
+              btn.style.background = 'rgba(70,70,70,0.5)';
+            }} else {{
+              btn.textContent = '🔇 Mute Alarm';
+              btn.style.background = 'rgba(200,0,0,0.45)';
+              siren();
+            }}
+          }}
+
+          // Start alarm on first click (browser autoplay policy)
+          document.addEventListener('click', function fire() {{
+            siren();
+            document.removeEventListener('click', fire);
+          }});
+
+          // Repeating siren every 1.1 s
+          alarmInterval = setInterval(siren, 1100);
+        </script>
+        </body>
+        </html>
+        """,
+        height=240,
+    )
 else:
-    st.success(f"✅ No alert (Threshold: {threshold:.2f})")
+    components.html(
+        f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <style>
+          * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+          body {{
+            background: #0e1117;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 200px;
+            font-family: 'Segoe UI', sans-serif;
+          }}
+          .card {{
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 12px;
+            background: rgba(0, 160, 60, 0.08);
+            border: 1px solid rgba(0, 220, 100, 0.25);
+            border-radius: 18px;
+            padding: 28px 48px;
+          }}
+          .bulb {{
+            width: 90px;
+            height: 90px;
+            border-radius: 50%;
+            background: radial-gradient(circle at 38% 35%, #90ffb8, #00cc55 55%, #006622);
+            box-shadow:
+              0 0 28px 8px rgba(0,200,80,0.85),
+              0 0 70px 25px rgba(0,180,60,0.45);
+            animation: pulse-green 1.6s ease-in-out infinite alternate;
+            border: 3px solid rgba(80, 255, 140, 0.45);
+          }}
+          @keyframes pulse-green {{
+            from {{ box-shadow: 0 0 28px 8px rgba(0,200,80,0.85), 0 0 70px 25px rgba(0,180,60,0.45); }}
+            to   {{ box-shadow: 0 0 46px 18px rgba(0,240,100,0.95), 0 0 100px 40px rgba(0,200,70,0.6); }}
+          }}
+          .label {{
+            color: #00e060;
+            font-size: 1.45rem;
+            font-weight: 800;
+            letter-spacing: 3px;
+            text-shadow: 0 0 14px rgba(0, 220, 80, 0.9);
+          }}
+          .score {{
+            color: #aaffcc;
+            font-size: 0.88rem;
+            letter-spacing: 0.5px;
+          }}
+        </style>
+        </head>
+        <body>
+        <div class="card">
+          <div class="bulb"></div>
+          <div class="label">✅ STABLE — NO ALERT</div>
+          <div class="score">Threshold: {threshold:.2f} &nbsp;|&nbsp; Score: {final_score:.1%}</div>
+        </div>
+        </body>
+        </html>
+        """,
+        height=200,
+    )
+
 
 # ── Feature Contributions ─────────────────────────────────────────────────────
 st.divider()
