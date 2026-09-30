@@ -1,0 +1,2 @@
+threshold,auroc,auprc,accuracy,precision,recall,f1,specificity,tn,fp,fn,tp,mean_lead_time_hours,median_lead_time_hours,proportion_lead_ge_4h,train_n,test_n,n_features
+0.5,1.0,1.0,0.9975,0.9836065573770492,1.0,0.9917355371900827,0.9970588235294118,339,1,0,60,14.183709317137481,14.246470142067933,1.0,1600,400,24
