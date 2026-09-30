@@ -4,17 +4,23 @@ import pandas as pd
 import numpy as np
 import joblib
 import time
+import shap
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 from pathlib import Path
 
 # ── Load model ────────────────────────────────────────────────────────────────
 OUT = Path('output')
-model_data = joblib.load(OUT / 'padew_thesis_model.joblib')
-base_pipe   = model_data['base_pipe']
-rf_anom     = model_data['rf_anom']
-threshold   = model_data['threshold']
+model_data   = joblib.load(OUT / 'padew_thesis_model.joblib')
+base_pipe    = model_data['base_pipe']
+rf_anom      = model_data['rf_anom']
+threshold    = model_data['threshold']
 feature_cols = model_data['feature_cols']
 
+
 st.set_page_config(page_title="ICU Deterioration Predictor", page_icon="🏥", layout="wide")
+
 
 # ── Default (healthy baseline) values ─────────────────────────────────────────
 DEFAULTS = {
@@ -88,6 +94,29 @@ SLIDER_BOUNDS = {
     'age':                  (18,    95),
     'charlson_index':       (0,     15),
 }
+
+# ── Cache SHAP explainers (built once, reused every rerun) ────────────────────
+@st.cache_resource
+def build_explainers():
+    imputer  = base_pipe.named_steps['imputer']
+    scaler   = base_pipe.named_steps['scaler']
+    lr_model = base_pipe.named_steps['model']
+
+    # Build a complete baseline row: DEFAULTS + binary features not in DEFAULTS
+    baseline_full = {
+        **DEFAULTS,
+        'sex_male':   1,   # male baseline
+        'ventilator': 1,
+        'vasopressor': 1,
+    }
+    # reindex ensures every column in feature_cols is present, filling any gaps with 0
+    bg        = pd.DataFrame([baseline_full]).reindex(columns=feature_cols, fill_value=0)
+    bg_imp    = imputer.transform(bg)
+    bg_scaled = scaler.transform(bg_imp)
+
+    lr_expl = shap.LinearExplainer(lr_model, bg_scaled, feature_perturbation='interventional')
+    rf_expl = shap.TreeExplainer(rf_anom)
+    return lr_expl, rf_expl, imputer, scaler
 
 # ── Session-state initialisation ───────────────────────────────────────────────
 if 'initialized' not in st.session_state:
@@ -479,27 +508,132 @@ else:
     )
 
 
-# ── Feature Contributions ─────────────────────────────────────────────────────
+# ── SHAP Explanations ─────────────────────────────────────────────────────────
 st.divider()
-st.subheader("Feature Contributions")
+st.subheader("🧠 SHAP Explanation")
+st.caption("Why did the model give this score? SHAP breaks the prediction into individual feature contributions.")
 
-coef    = base_pipe.named_steps['model'].coef_[0]
-scaler  = base_pipe.named_steps['scaler']
-imputer = base_pipe.named_steps['imputer']
+try:
+    lr_explainer, rf_explainer, _imp, _scaler = build_explainers()
 
-X_imp         = imputer.transform(X)
-X_scaled      = scaler.transform(X_imp)
-contributions = X_scaled[0] * coef
+    # Prepare scaled input for LR
+    X_imp_s    = _imp.transform(X)
+    X_scaled_s = _scaler.transform(X_imp_s)
+    X_scaled_df = pd.DataFrame(X_scaled_s, columns=feature_cols)
 
-contrib_df = pd.DataFrame({
-    'feature':      feature_cols,
-    'contribution': contributions,
-}).sort_values('contribution', key=abs, ascending=False)
+    # ─ LR SHAP values (handle all SHAP version output shapes) ─
+    lr_shap_raw = np.array(lr_explainer.shap_values(X_scaled_df))
+    # Possible shapes: (n_feat,) | (1,n_feat) | (n_classes,1,n_feat) | (1,n_feat,n_classes)
+    if lr_shap_raw.ndim == 1:
+        lr_sv = lr_shap_raw                       # already 1-D
+    elif lr_shap_raw.ndim == 2:
+        lr_sv = lr_shap_raw[0]                    # (n_samples, n_feat) → first sample
+    elif lr_shap_raw.ndim == 3 and lr_shap_raw.shape[0] == 2:
+        lr_sv = lr_shap_raw[1, 0, :]              # (2, n_samples, n_feat) → class-1, sample-0
+    elif lr_shap_raw.ndim == 3:
+        lr_sv = lr_shap_raw[0, :, -1]             # (n_samples, n_feat, n_classes) → sample-0, class-1
+    else:
+        lr_sv = lr_shap_raw.flatten()[:len(feature_cols)]
 
-st.dataframe(
-    contrib_df.head(10).style.format({'contribution': '{:.3f}'}),
-    use_container_width=True,
-)
+    lr_ev_raw = lr_explainer.expected_value
+    lr_ev = float(np.array(lr_ev_raw).flatten()[-1])
+
+    lr_exp = shap.Explanation(
+        values=lr_sv.astype(float),
+        base_values=lr_ev,
+        data=X_scaled_df.iloc[0].values,
+        feature_names=feature_cols,
+    )
+
+    # ─ RF SHAP values ─
+    rf_shap_raw = rf_explainer.shap_values(X)
+    rf_sv_arr   = np.array(rf_shap_raw)
+    if rf_sv_arr.ndim == 1:
+        rf_sv = rf_sv_arr
+    elif rf_sv_arr.ndim == 2:
+        rf_sv = rf_sv_arr[0]                      # (n_samples, n_feat)
+    elif rf_sv_arr.ndim == 3 and rf_sv_arr.shape[0] == 2:
+        rf_sv = rf_sv_arr[1, 0, :]                # list-of-2 → class-1, sample-0
+    elif rf_sv_arr.ndim == 3:
+        rf_sv = rf_sv_arr[0, :, -1]               # (n_samples, n_feat, n_classes)
+    else:
+        rf_sv = rf_sv_arr.flatten()[:len(feature_cols)]
+
+    rf_ev_raw = rf_explainer.expected_value
+    rf_ev = float(np.array(rf_ev_raw).flatten()[-1])
+
+    rf_exp = shap.Explanation(
+        values=rf_sv.astype(float),
+        base_values=rf_ev,
+        data=X.iloc[0].values.astype(float),
+        feature_names=feature_cols,
+    )
+
+
+    tab1, tab2 = st.tabs(["📉 Risk Model (Logistic Regression)", "🌲 Anomaly Model (Random Forest)"])
+
+    # Dark matplotlib style matching Streamlit dark theme
+    dark_style = {
+        'axes.facecolor':   '#0e1117',
+        'figure.facecolor': '#0e1117',
+        'text.color':       '#fafafa',
+        'axes.labelcolor':  '#fafafa',
+        'xtick.color':      '#aaaaaa',
+        'ytick.color':      '#fafafa',
+        'axes.edgecolor':   '#333333',
+        'grid.color':       '#222222',
+    }
+
+    with tab1:
+        st.markdown("""
+        **How to read:** Each bar shows how much a feature **pushed the score up ▶ (red)**
+        or **pulled it down ◀ (blue)** from the baseline.  
+        The sum of all bars + baseline = final predicted probability.
+        """)
+        with plt.rc_context(dark_style):
+            shap.plots.waterfall(lr_exp, max_display=12, show=False)
+            fig1 = plt.gcf()
+            fig1.patch.set_facecolor('#0e1117')
+            for ax in fig1.axes:
+                ax.set_facecolor('#0e1117')
+                ax.tick_params(colors='#cccccc')
+            fig1.set_size_inches(9, 5)
+            st.pyplot(fig1, use_container_width=True)
+            plt.close(fig1)
+
+    with tab2:
+        st.markdown("""
+        **How to read:** Shows which vitals made the **Random Forest flag this patient as anomalous**.
+        Longer red bars = stronger push toward anomaly; blue bars = toward normal.
+        """)
+        rf_df = pd.DataFrame({'feature': feature_cols, 'shap': rf_sv})
+        rf_df = rf_df.iloc[rf_df['shap'].abs().argsort()]
+        colors = ['#e05252' if v > 0 else '#5285e0' for v in rf_df['shap']]
+
+        with plt.rc_context(dark_style):
+            fig2, ax2 = plt.subplots(figsize=(9, 6))
+            ax2.barh(rf_df['feature'], rf_df['shap'], color=colors, edgecolor='none', height=0.65)
+            ax2.axvline(0, color='#555555', linewidth=0.8)
+            ax2.set_xlabel('SHAP value (impact on anomaly score)', color='#aaaaaa', fontsize=9)
+            ax2.set_title('Random Forest Anomaly — Feature Impact', color='#fafafa', fontsize=11, pad=10)
+            ax2.tick_params(axis='y', labelsize=8.5)
+            ax2.tick_params(axis='x', labelsize=8)
+            fig2.tight_layout()
+            st.pyplot(fig2, use_container_width=True)
+            plt.close(fig2)
+
+except Exception as e:
+    st.warning(f"⚠️ SHAP explanation unavailable: {e}")
+    # Fallback: simple coefficient table
+    coef    = base_pipe.named_steps['model'].coef_[0]
+    scaler  = base_pipe.named_steps['scaler']
+    imputer = base_pipe.named_steps['imputer']
+    X_imp_f       = imputer.transform(X)
+    X_scaled_f    = scaler.transform(X_imp_f)
+    contributions = X_scaled_f[0] * coef
+    contrib_df = pd.DataFrame({'feature': feature_cols, 'contribution': contributions})
+    contrib_df = contrib_df.iloc[contrib_df['contribution'].abs().argsort()[::-1]]
+    st.dataframe(contrib_df.head(10).style.format({'contribution': '{:.3f}'}), use_container_width=True)
 
 st.divider()
 st.caption("Model: Logistic Regression + Random Forest ensemble | Threshold tuned for clinical utility")
